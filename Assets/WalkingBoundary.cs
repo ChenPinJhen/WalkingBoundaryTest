@@ -9,7 +9,7 @@ using UnityEngine.XR;
 [DisallowMultipleComponent]
 public sealed class WalkingBoundary : MonoBehaviour
 {
-    public enum Route { Circle, Straight }
+    public enum Route { Square = 0, Straight = 1, Hybrid = 2 }
 
     [Header("路線與模型")]
     [SerializeField] private Route route;
@@ -20,24 +20,30 @@ public sealed class WalkingBoundary : MonoBehaviour
     [SerializeField] private GameObject gridModel;
 
     [Header("起始行走範圍（公尺）")]
-    [Min(0.5f), SerializeField] private float circleDiameter = 5f;
+    [UnityEngine.Serialization.FormerlySerializedAs("circleDiameter")]
+    [Min(1f), SerializeField] private float squareSize = 5f;
     [Min(0.5f), SerializeField] private float straightLength = 7f;
     [Min(0.5f), SerializeField] private float straightWidth = 2f;
 
     [Header("收縮與顯示（公尺）")]
-    [Tooltip("每圈縮掉的半徑，或每次折返時直線兩端各往中點移動的距離。")]
+    [Tooltip("方形每次觸發時各邊的內縮量，或直線每次折返時每端縮短的距離。")]
     [Min(0f), SerializeField] private float shrinkStep = 0.25f;
-    [Tooltip("圓圈的最小直徑，或直線的最小全長。")]
+    [Tooltip("第二種直線路線的最小全長。方形和混合路線的最終區域是 1 × 1 公尺。")]
     [Min(0.5f), SerializeField] private float minimumSize = 1f;
     [Min(0f), SerializeField] private float revealDistance = 0.6f;
     [Min(0f), SerializeField] private float shrinkSeconds = 0.65f;
     [Min(0.1f), SerializeField] private float gridHeight = 2f;
 
+    [Header("越界畫面")]
+    [SerializeField] private bool solidColorOutside = true;
+    [SerializeField] private Color outsideColor = Color.white;
+
+    [SerializeField, HideInInspector] private bool hybridDiagonal;
+
     [Header("腳步")]
     [Min(0.2f), SerializeField] private float footstepSpacing = 0.55f;
     [Min(0f), SerializeField] private float pathInset = 0.25f;
     [Min(0.05f), SerializeField] private float arrivalTolerance = 0.2f;
-    [Min(0.05f), SerializeField] private float circlePathTolerance = 0.35f;
     [SerializeField] private float footstepYaw;
 
 #if UNITY_EDITOR
@@ -50,7 +56,6 @@ public sealed class WalkingBoundary : MonoBehaviour
     private Vector3 simulatedOffset;
 #endif
 
-    private const float FullTurn = 360f;
     private readonly List<Transform> steps = new();
     private readonly List<Transform> panels = new();
     private Transform guideRoot;
@@ -64,18 +69,19 @@ public sealed class WalkingBoundary : MonoBehaviour
     private float targetExtent;
     private float transitionStart;
     private float transitionTime;
-    private float previousAngle;
-    private float walkedAngle;
-    private bool lapStarted;
     private bool waitingAtStart;
+    private bool approachConsumed;
+    private bool activeHybridDiagonal;
+    private bool outsideViewActive;
+    private readonly Dictionary<Camera, (int mask, CameraClearFlags flags, Color color)> cameraViews = new();
     private int direction;
     private Route activeRoute;
 
     private void OnEnable()
     {
-        if (headset == null || footsteps == null || gridModel == null)
+        if (headset == null || gridModel == null)
         {
-            Debug.LogError("WalkingBoundary 需要頭顯、腳步模型和有 MeshRenderer 的網格面。", this);
+            Debug.LogError("WalkingBoundary 需要頭顯和有 MeshRenderer 的網格面。", this);
             enabled = false;
             return;
         }
@@ -111,7 +117,11 @@ public sealed class WalkingBoundary : MonoBehaviour
 
         guideRoot = CreateRoot("Footstep Guide");
         gridRoot = CreateRoot("Boundary Grid");
-        gridRoot.gameObject.SetActive(false);
+        OVRCameraRig cameraRig = headset.GetComponentInParent<OVRCameraRig>();
+        Camera[] cameras = cameraRig != null ? cameraRig.GetComponentsInChildren<Camera>(true)
+            : headset.GetComponentsInChildren<Camera>(true);
+        foreach (Camera camera in cameras)
+            cameraViews.Add(camera, (camera.cullingMask, camera.clearFlags, camera.backgroundColor));
         ResetRoute();
 #if UNITY_EDITOR
         OVRCameraRig rig = headset.GetComponentInParent<OVRCameraRig>();
@@ -124,6 +134,8 @@ public sealed class WalkingBoundary : MonoBehaviour
 #if UNITY_EDITOR
         ResetSimulatedOffset();
 #endif
+        SetOutsideView(false);
+        cameraViews.Clear();
         ReleaseRoot(guideRoot);
         ReleaseRoot(gridRoot);
         steps.Clear();
@@ -185,29 +197,46 @@ public sealed class WalkingBoundary : MonoBehaviour
     private void ResetRoute()
     {
         activeRoute = route;
+        activeHybridDiagonal = hybridDiagonal;
         extent = targetExtent = StartingExtent;
         direction = 1;
         waitingAtStart = true;
-        lapStarted = false;
-        walkedAngle = 0f;
+        approachConsumed = false;
         UpdateLayout();
     }
 
-    private float StartingExtent => Mathf.Max(0.25f, (route == Route.Circle ? circleDiameter : straightLength) * 0.5f);
-    private float HalfWidth => Mathf.Max(0.25f, straightWidth * 0.5f);
-    private float PathExtent => GetPathExtent(extent);
-    private float GetPathExtent(float boundaryExtent) =>
-        boundaryExtent - Mathf.Clamp(pathInset, 0f, boundaryExtent * 0.45f);
+    private bool IsSquare => route == Route.Square || route == Route.Hybrid && !hybridDiagonal;
+    private float SquareHalf => Mathf.Max(0.5f, squareSize * 0.5f);
+    private float StartingExtent => IsSquare ? SquareHalf : route == Route.Hybrid
+        ? Mathf.Max(0.5f, (SquareHalf - 0.5f) * Mathf.Sqrt(2f)) : Mathf.Max(0.25f, straightLength * 0.5f);
+    private float HalfWidth => IsSquare ? extent : route == Route.Hybrid
+        ? Mathf.Min(extent, Mathf.Max(0.5f, straightWidth * 0.5f)) : Mathf.Max(0.25f, straightWidth * 0.5f);
+    private float MinimumExtent => route == Route.Straight
+        ? Mathf.Clamp(minimumSize * 0.5f, 0.25f, StartingExtent) : 0.5f;
+    private Vector3 AreaCenter => route == Route.Hybrid && IsSquare
+        ? new Vector3(extent - SquareHalf, 0f, SquareHalf - extent) : Vector3.zero;
+    private Quaternion AreaRotation => route == Route.Hybrid && hybridDiagonal
+        ? Quaternion.Euler(0f, 135f, 0f) : Quaternion.identity;
+    private float PathExtent => extent - Mathf.Clamp(pathInset, 0f, extent * 0.45f);
     private float Tolerance => Mathf.Clamp(arrivalTolerance, 0.05f, PathExtent * 0.45f);
+
+    public void SetHybridDiagonal(bool diagonal)
+    {
+        if (route != Route.Hybrid || hybridDiagonal == diagonal)
+            return;
+        hybridDiagonal = diagonal;
+        if (Application.isPlaying && gridRoot != null)
+            ResetRoute();
+    }
 
     private void LateUpdate()
     {
-        if (route != activeRoute)
+        if (route != activeRoute || hybridDiagonal != activeHybridDiagonal)
             ResetRoute();
 
-        Vector3 local = transform.InverseTransformPoint(headset.position);
+        Vector3 local = Quaternion.Inverse(AreaRotation) *
+            (transform.InverseTransformPoint(headset.position) - AreaCenter);
         Vector2 position = new(local.x, local.z);
-
         if (extent != targetExtent)
         {
             transitionTime += Time.deltaTime;
@@ -215,56 +244,84 @@ public sealed class WalkingBoundary : MonoBehaviour
             extent = Mathf.Lerp(transitionStart, targetExtent, Mathf.SmoothStep(0f, 1f, fraction));
             UpdateLayout();
         }
-        else if (route == Route.Circle)
+        else if (route == Route.Hybrid && IsSquare && extent <= MinimumExtent)
         {
-            TrackCircle(position);
+            SetHybridDiagonal(true);
+        }
+        else if (IsSquare)
+        {
+            TrackSquare(Mathf.Min(HalfWidth - Mathf.Abs(position.x), extent - Mathf.Abs(position.y)));
         }
         else
         {
             TrackStraight(position);
         }
 
-        float distance = route == Route.Circle
-            ? extent - position.magnitude
-            : Mathf.Min(HalfWidth - Mathf.Abs(position.x), extent - Mathf.Abs(position.y));
-        bool showGrid = distance <= revealDistance;
-        if (gridRoot.gameObject.activeSelf != showGrid)
-            gridRoot.gameObject.SetActive(showGrid);
+        // The center and half extents can change during this frame's transition.
+        local = Quaternion.Inverse(AreaRotation) *
+            (transform.InverseTransformPoint(headset.position) - AreaCenter);
+        UpdateVisibility(local);
     }
 
-    private void TrackCircle(Vector2 position)
+    private void UpdateVisibility(Vector3 position)
     {
-        float angle = Mathf.Atan2(position.x, position.y) * Mathf.Rad2Deg;
-        float tolerance = Mathf.Clamp(circlePathTolerance, 0.05f, PathExtent * 0.65f);
-        bool onPath = Mathf.Abs(position.magnitude - PathExtent) <= tolerance;
-        if (!onPath)
+        float left = HalfWidth + position.x;
+        float right = HalfWidth - position.x;
+        float near = extent + position.z;
+        float far = extent - position.z;
+        float nearest = Mathf.Min(Mathf.Min(left, right), Mathf.Min(near, far));
+        // Keep a central region that can hide the grid and rearm the approach at small sizes.
+        float threshold = IsSquare ? Mathf.Min(revealDistance, extent * 0.85f) : revealDistance;
+        int visible = -1;
+        if (nearest <= threshold)
+            visible = nearest == left ? 0 : nearest == right ? 1 : nearest == near ? 2 : 3;
+        for (int i = 0; i < panels.Count; i++)
         {
-            lapStarted = false;
+            if (panels[i].gameObject.activeSelf != (i == visible))
+                panels[i].gameObject.SetActive(i == visible);
+        }
+        SetOutsideView(solidColorOutside && nearest < 0f);
+    }
+
+    private void TrackSquare(float distance)
+    {
+        float threshold = Mathf.Min(revealDistance, extent * 0.85f);
+        if (approachConsumed)
+        {
+            if (distance > threshold + Mathf.Min(0.05f, extent * 0.1f))
+                approachConsumed = false;
             return;
         }
 
-        if (!lapStarted)
+        if (distance <= threshold)
         {
-            lapStarted = true;
-            previousAngle = angle;
-            walkedAngle = 0f;
-            return;
-        }
-
-        float delta = Mathf.DeltaAngle(previousAngle, angle);
-        previousAngle = angle;
-        if (Mathf.Abs(delta) > 35f)
-        {
-            lapStarted = false;
-            return;
-        }
-
-        walkedAngle += delta;
-        if (walkedAngle >= FullTurn - 0.01f)
-        {
-            lapStarted = false;
+            approachConsumed = true;
             BeginShrink();
         }
+    }
+
+    private void SetOutsideView(bool outside)
+    {
+        foreach (var entry in cameraViews)
+        {
+            Camera camera = entry.Key;
+            if (camera == null)
+                continue;
+            var original = entry.Value;
+            if (outside)
+            {
+                camera.cullingMask = 0;
+                camera.clearFlags = CameraClearFlags.SolidColor;
+                camera.backgroundColor = outsideColor;
+            }
+            else if (outsideViewActive)
+            {
+                camera.cullingMask = original.mask;
+                camera.clearFlags = original.flags;
+                camera.backgroundColor = original.color;
+            }
+        }
+        outsideViewActive = outside;
     }
 
     private void TrackStraight(Vector2 position)
@@ -289,8 +346,7 @@ public sealed class WalkingBoundary : MonoBehaviour
 
     private void BeginShrink()
     {
-        float minimumExtent = Mathf.Clamp(minimumSize * 0.5f, 0.25f, extent);
-        targetExtent = Mathf.Max(minimumExtent, extent - Mathf.Max(0f, shrinkStep));
+        targetExtent = Mathf.Max(MinimumExtent, extent - Mathf.Max(0f, shrinkStep));
         transitionStart = extent;
         transitionTime = 0f;
         if (shrinkSeconds <= 0f)
@@ -302,65 +358,39 @@ public sealed class WalkingBoundary : MonoBehaviour
 
     private void UpdateLayout()
     {
-        var (stepCount, panelCount) = Layout(extent, direction, PlaceStep, PlacePanel);
-        HideUnused(steps, stepCount);
-        HideUnused(panels, panelCount);
+        guideRoot.SetLocalPositionAndRotation(AreaCenter, AreaRotation);
+        gridRoot.SetLocalPositionAndRotation(AreaCenter, AreaRotation);
+        int stepCount = Layout(extent, HalfWidth, IsSquare, direction, PlaceStep, PlacePanel);
+        HideUnused(steps, footsteps != null ? stepCount : 0);
     }
 
-    private (int steps, int panels) Layout(float extent, int direction,
+    private int Layout(float length, float width, bool square, int heading,
         Action<int, Vector3, float> placeStep, Action<int, Vector3, Vector3> placePanel)
     {
-        float pathExtent = GetPathExtent(extent);
-        int stepCount;
-        int panelCount;
-        if (route == Route.Circle)
+        int stepCount = 0;
+        if (!square)
         {
-            float circumference = 2f * Mathf.PI * pathExtent;
-            stepCount = Mathf.Clamp(Mathf.RoundToInt(circumference / Mathf.Max(0.2f, footstepSpacing)), 4, 256);
-            panelCount = Mathf.Clamp(Mathf.CeilToInt(2f * Mathf.PI * extent / 0.8f), 16, 64);
+            float path = length - Mathf.Clamp(pathInset, 0f, length * 0.45f);
+            stepCount = Mathf.Clamp(Mathf.RoundToInt(2f * path / Mathf.Max(0.2f, footstepSpacing)) + 1, 2, 256);
             for (int i = 0; i < stepCount; i++)
             {
-                float angle = FullTurn * i / stepCount;
-                placeStep(i, CirclePoint(pathExtent, angle), angle + 90f);
-            }
-            for (int i = 0; i < panelCount; i++)
-            {
-                float angle = FullTurn * i / panelCount;
-                placePanel(i, CirclePoint(extent, angle), CirclePoint(extent, angle + FullTurn / panelCount));
+                float z = Mathf.Lerp(-path, path, (float)i / (stepCount - 1)) * heading;
+                placeStep(i, new Vector3(0f, 0f, z), heading > 0 ? 0f : 180f);
             }
         }
-        else
-        {
-            stepCount = Mathf.Clamp(Mathf.RoundToInt(2f * pathExtent / Mathf.Max(0.2f, footstepSpacing)) + 1, 2, 256);
-            for (int i = 0; i < stepCount; i++)
-            {
-                float z = Mathf.Lerp(-pathExtent, pathExtent, (float)i / (stepCount - 1)) * direction;
-                placeStep(i, new Vector3(0f, 0f, z), direction > 0 ? 0f : 180f);
-            }
 
-            int sideCount = Mathf.Clamp(Mathf.CeilToInt(2f * extent / 2.5f), 1, 32);
-            for (int i = 0; i < sideCount; i++)
-            {
-                float from = Mathf.Lerp(-extent, extent, (float)i / sideCount);
-                float to = Mathf.Lerp(-extent, extent, (float)(i + 1) / sideCount);
-                placePanel(2 * i, new Vector3(-HalfWidth, 0f, from), new Vector3(-HalfWidth, 0f, to));
-                placePanel(2 * i + 1, new Vector3(HalfWidth, 0f, to), new Vector3(HalfWidth, 0f, from));
-            }
-            placePanel(2 * sideCount, new Vector3(HalfWidth, 0f, -extent), new Vector3(-HalfWidth, 0f, -extent));
-            placePanel(2 * sideCount + 1, new Vector3(-HalfWidth, 0f, extent), new Vector3(HalfWidth, 0f, extent));
-            panelCount = 2 * sideCount + 2;
-        }
-        return (stepCount, panelCount);
-    }
-
-    private static Vector3 CirclePoint(float radius, float degrees)
-    {
-        float radians = degrees * Mathf.Deg2Rad;
-        return new Vector3(Mathf.Sin(radians) * radius, 0f, Mathf.Cos(radians) * radius);
+        placePanel(0, new Vector3(-width, 0f, -length), new Vector3(-width, 0f, length));
+        placePanel(1, new Vector3(width, 0f, length), new Vector3(width, 0f, -length));
+        placePanel(2, new Vector3(width, 0f, -length), new Vector3(-width, 0f, -length));
+        placePanel(3, new Vector3(-width, 0f, length), new Vector3(width, 0f, length));
+        return stepCount;
     }
 
     private void PlaceStep(int index, Vector3 position, float yaw)
     {
+        if (footsteps == null)
+            return;
+
         if (index == steps.Count)
             steps.Add(Instantiate(footsteps, guideRoot).transform);
 
@@ -376,6 +406,7 @@ public sealed class WalkingBoundary : MonoBehaviour
         {
             GameObject panel = new("Grid Panel");
             panel.transform.SetParent(gridRoot, false);
+            panel.SetActive(false);
             GameObject mesh = new("Mesh");
             mesh.transform.SetParent(panel.transform, false);
             mesh.transform.localRotation = panelRotation;
@@ -392,7 +423,7 @@ public sealed class WalkingBoundary : MonoBehaviour
         instance.localPosition = (start + end) * 0.5f;
         instance.localRotation = Quaternion.LookRotation(Vector3.Cross(Vector3.up, edge));
         instance.localScale = new Vector3(edge.magnitude / panelSize.x, gridHeight / panelSize.y, 1f);
-        instance.gameObject.SetActive(true);
+
     }
 
     private static void HideUnused(List<Transform> objects, int used)
@@ -407,12 +438,14 @@ public sealed class WalkingBoundary : MonoBehaviour
         if (Application.isPlaying || !enabled || !showScenePreview)
             return;
 
-        Matrix4x4 world = transform.localToWorldMatrix;
+        Matrix4x4 world = transform.localToWorldMatrix * Matrix4x4.Rotate(AreaRotation);
         MeshFilter[] stepMeshes = footsteps != null ? footsteps.GetComponentsInChildren<MeshFilter>() : null;
         Mesh grid = WalkingGridPreview.FindPanel(gridModel);
         Matrix4x4 oldMatrix = Gizmos.matrix;
         Color oldColor = Gizmos.color;
-        Layout(StartingExtent, 1,
+        float previewWidth = IsSquare ? StartingExtent : route == Route.Hybrid
+            ? Mathf.Min(StartingExtent, Mathf.Max(0.5f, straightWidth * 0.5f)) : HalfWidth;
+        Layout(StartingExtent, previewWidth, IsSquare, 1,
             (_, position, yaw) =>
             {
                 if (stepMeshes == null)
@@ -444,23 +477,4 @@ public sealed class WalkingBoundary : MonoBehaviour
         Gizmos.color = oldColor;
     }
 #endif
-
-    private void OnDrawGizmosSelected()
-    {
-        Gizmos.matrix = transform.localToWorldMatrix;
-        Gizmos.color = Color.cyan;
-        float radius = Application.isPlaying ? extent : StartingExtent;
-        if (route == Route.Straight)
-        {
-            Gizmos.DrawWireCube(Vector3.zero, new Vector3(2f * HalfWidth, 0f, 2f * radius));
-            float start = radius - Mathf.Clamp(pathInset, 0f, radius * 0.45f);
-            Gizmos.DrawWireSphere(Vector3.back * start, 0.12f);
-            return;
-        }
-
-        const int segments = 64;
-        for (int i = 0; i < segments; i++)
-            Gizmos.DrawLine(CirclePoint(radius, FullTurn * i / segments),
-                CirclePoint(radius, FullTurn * (i + 1) / segments));
-    }
 }
