@@ -31,7 +31,6 @@ public sealed class WalkingBoundary : MonoBehaviour
     [Tooltip("第二種直線路線的最小全長。方形和混合路線的最終區域是 1 × 1 公尺。")]
     [Min(0.5f), SerializeField] private float minimumSize = 1f;
     [Min(0f), SerializeField] private float revealDistance = 0.6f;
-    [Min(0f), SerializeField] private float shrinkSeconds = 0.65f;
     [Min(0.1f), SerializeField] private float gridHeight = 2f;
 
     [Header("越界畫面")]
@@ -67,10 +66,7 @@ public sealed class WalkingBoundary : MonoBehaviour
     private Vector3 panelSize;
     private float extent;
     private float targetExtent;
-    private float transitionStart;
-    private float transitionTime;
     private bool waitingAtStart;
-    private bool approachConsumed;
     private bool activeHybridDiagonal;
     private bool outsideViewActive;
     private readonly Dictionary<Camera, (int mask, CameraClearFlags flags, Color color)> cameraViews = new();
@@ -201,7 +197,6 @@ public sealed class WalkingBoundary : MonoBehaviour
         extent = targetExtent = StartingExtent;
         direction = 1;
         waitingAtStart = true;
-        approachConsumed = false;
         UpdateLayout();
     }
 
@@ -209,12 +204,14 @@ public sealed class WalkingBoundary : MonoBehaviour
     private float SquareHalf => Mathf.Max(0.5f, squareSize * 0.5f);
     private float StartingExtent => IsSquare ? SquareHalf : route == Route.Hybrid
         ? Mathf.Max(0.5f, (SquareHalf - 0.5f) * Mathf.Sqrt(2f)) : Mathf.Max(0.25f, straightLength * 0.5f);
-    private float HalfWidth => IsSquare ? extent : route == Route.Hybrid
-        ? Mathf.Min(extent, Mathf.Max(0.5f, straightWidth * 0.5f)) : Mathf.Max(0.25f, straightWidth * 0.5f);
+    private float HalfWidth => GetHalfWidth(extent);
+    private float GetHalfWidth(float halfLength) => IsSquare ? halfLength : route == Route.Hybrid
+        ? Mathf.Min(halfLength, Mathf.Max(0.5f, straightWidth * 0.5f)) : Mathf.Max(0.25f, straightWidth * 0.5f);
     private float MinimumExtent => route == Route.Straight
         ? Mathf.Clamp(minimumSize * 0.5f, 0.25f, StartingExtent) : 0.5f;
-    private Vector3 AreaCenter => route == Route.Hybrid && IsSquare
-        ? new Vector3(extent - SquareHalf, 0f, SquareHalf - extent) : Vector3.zero;
+    private Vector3 AreaCenter => GetAreaCenter(extent);
+    private Vector3 GetAreaCenter(float halfLength) => route == Route.Hybrid && IsSquare
+        ? new Vector3(halfLength - SquareHalf, 0f, SquareHalf - halfLength) : Vector3.zero;
     private Quaternion AreaRotation => route == Route.Hybrid && hybridDiagonal
         ? Quaternion.Euler(0f, 135f, 0f) : Quaternion.identity;
     private float PathExtent => extent - Mathf.Clamp(pathInset, 0f, extent * 0.45f);
@@ -234,34 +231,49 @@ public sealed class WalkingBoundary : MonoBehaviour
         if (route != activeRoute || hybridDiagonal != activeHybridDiagonal)
             ResetRoute();
 
-        Vector3 local = Quaternion.Inverse(AreaRotation) *
-            (transform.InverseTransformPoint(headset.position) - AreaCenter);
-        Vector2 position = new(local.x, local.z);
+        Vector3 headPosition = transform.InverseTransformPoint(headset.position);
+        Vector3 local = ToAreaPosition(headPosition, extent);
         if (extent != targetExtent)
         {
-            transitionTime += Time.deltaTime;
-            float fraction = shrinkSeconds > 0f ? Mathf.Clamp01(transitionTime / shrinkSeconds) : 1f;
-            extent = Mathf.Lerp(transitionStart, targetExtent, Mathf.SmoothStep(0f, 1f, fraction));
-            UpdateLayout();
+            if (IsClearOfGrid(local, extent) &&
+                IsClearOfGrid(ToAreaPosition(headPosition, targetExtent), targetExtent))
+            {
+                // Both layouts are hidden from this position. Apply the new size before rendering.
+                HideUnused(panels, 0);
+                extent = targetExtent;
+                UpdateLayout();
+                local = ToAreaPosition(headPosition, extent);
+            }
         }
         else if (route == Route.Hybrid && IsSquare && extent <= MinimumExtent)
         {
             SetHybridDiagonal(true);
+            local = ToAreaPosition(headPosition, extent);
         }
         else if (IsSquare)
         {
-            TrackSquare(Mathf.Min(HalfWidth - Mathf.Abs(position.x), extent - Mathf.Abs(position.y)));
+            if (NearestEdgeDistance(local, extent) <= RevealThreshold(extent))
+                QueueShrink();
         }
         else
         {
-            TrackStraight(position);
+            TrackStraight(new Vector2(local.x, local.z));
         }
 
-        // The center and half extents can change during this frame's transition.
-        local = Quaternion.Inverse(AreaRotation) *
-            (transform.InverseTransformPoint(headset.position) - AreaCenter);
         UpdateVisibility(local);
     }
+
+    private Vector3 ToAreaPosition(Vector3 position, float halfLength) =>
+        Quaternion.Inverse(AreaRotation) * (position - GetAreaCenter(halfLength));
+
+    private float NearestEdgeDistance(Vector3 position, float halfLength) =>
+        Mathf.Min(GetHalfWidth(halfLength) - Mathf.Abs(position.x), halfLength - Mathf.Abs(position.z));
+
+    private float RevealThreshold(float halfLength) =>
+        Mathf.Min(revealDistance, 0.85f * Mathf.Min(GetHalfWidth(halfLength), halfLength));
+
+    private bool IsClearOfGrid(Vector3 position, float halfLength) =>
+        NearestEdgeDistance(position, halfLength) > RevealThreshold(halfLength) + 0.02f;
 
     private void UpdateVisibility(Vector3 position)
     {
@@ -270,8 +282,7 @@ public sealed class WalkingBoundary : MonoBehaviour
         float near = extent + position.z;
         float far = extent - position.z;
         float nearest = Mathf.Min(Mathf.Min(left, right), Mathf.Min(near, far));
-        // Keep a central region that can hide the grid and rearm the approach at small sizes.
-        float threshold = IsSquare ? Mathf.Min(revealDistance, extent * 0.85f) : revealDistance;
+        float threshold = RevealThreshold(extent);
         int visible = -1;
         if (nearest <= threshold)
             visible = nearest == left ? 0 : nearest == right ? 1 : nearest == near ? 2 : 3;
@@ -281,23 +292,6 @@ public sealed class WalkingBoundary : MonoBehaviour
                 panels[i].gameObject.SetActive(i == visible);
         }
         SetOutsideView(solidColorOutside && nearest < 0f);
-    }
-
-    private void TrackSquare(float distance)
-    {
-        float threshold = Mathf.Min(revealDistance, extent * 0.85f);
-        if (approachConsumed)
-        {
-            if (distance > threshold + Mathf.Min(0.05f, extent * 0.1f))
-                approachConsumed = false;
-            return;
-        }
-
-        if (distance <= threshold)
-        {
-            approachConsumed = true;
-            BeginShrink();
-        }
     }
 
     private void SetOutsideView(bool outside)
@@ -339,21 +333,14 @@ public sealed class WalkingBoundary : MonoBehaviour
         if (position.y * direction >= PathExtent - Tolerance)
         {
             direction = -direction;
-            BeginShrink();
+            QueueShrink();
             UpdateLayout();
         }
     }
 
-    private void BeginShrink()
+    private void QueueShrink()
     {
         targetExtent = Mathf.Max(MinimumExtent, extent - Mathf.Max(0f, shrinkStep));
-        transitionStart = extent;
-        transitionTime = 0f;
-        if (shrinkSeconds <= 0f)
-        {
-            extent = targetExtent;
-            UpdateLayout();
-        }
     }
 
     private void UpdateLayout()
@@ -477,4 +464,12 @@ public sealed class WalkingBoundary : MonoBehaviour
         Gizmos.color = oldColor;
     }
 #endif
+
+    // Ground dimensions are in boundary-local X and Z, before applying the area's rotation.
+    public Vector2 AuthoredAreaSize => route == Route.Straight
+        ? new Vector2(Mathf.Max(0.5f, straightWidth), Mathf.Max(0.5f, straightLength))
+        : Vector2.one * (2f * SquareHalf);
+
+    public (Vector3 center, Quaternion rotation, Vector2 size) CurrentArea =>
+        (AreaCenter, AreaRotation, new Vector2(2f * HalfWidth, 2f * extent));
 }
